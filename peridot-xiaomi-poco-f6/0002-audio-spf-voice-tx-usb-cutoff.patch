@@ -1,0 +1,1831 @@
+From: AVCRT Development <avcrt@localhost>
+Subject: [PATCH 2/2] audio: spf: track cellular TX and lease USB uplink cutoff
+
+Track the acknowledged voice graph and current codec or USB TX leg,
+including a bounded retry after a rejected reroute START. Bind USB stock
+TX cutoff to a single live route and owner, verify the DSP mute state,
+and restore it on expiry or route loss. Observe private capture STOP/CLOSE
+ACKs so userspace can decide whether it is safe to restart.
+
+diff --git a/qcom/opensource/audio-kernel/ipc/Kbuild b/qcom/opensource/audio-kernel/ipc/Kbuild
+index 685000bc8e5f85eb095c03f6fa2fae846667e292..007ef39564e5bacb00c5c5a2456d610d0f43b901 100644
+--- a/qcom/opensource/audio-kernel/ipc/Kbuild
++++ b/qcom/opensource/audio-kernel/ipc/Kbuild
+@@ -160,6 +160,7 @@ INCS +=	$(COMMON_INC) \
+ 		$(UAPI_INC)
+ 
+ EXTRA_CFLAGS += $(INCS)
++CFLAGS_audio-pkt.o += -I$(AUDIO_ROOT)/ipc
+ 
+ 
+ CDEFINES +=	-DANI_LITTLE_BYTE_ENDIAN \
+diff --git a/qcom/opensource/audio-kernel/ipc/audio-pkt.c b/qcom/opensource/audio-kernel/ipc/audio-pkt.c
+index 9d3ce8e03f497555e07152e8cd390dee773852c9..a8d4f95b88b96d86165ac112bdcc7e62eefdc750 100755
+--- a/qcom/opensource/audio-kernel/ipc/audio-pkt.c
++++ b/qcom/opensource/audio-kernel/ipc/audio-pkt.c
+@@ -27,10 +27,16 @@
+ #include <linux/fs.h>
+ #include <linux/uaccess.h>
+ #include <linux/termios.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include <asm/unaligned.h>
+ #include <ipc/gpr-lite.h>
+ #include <dsp/spf-core.h>
+ #include <dsp/msm_audio_ion.h>
+ 
++#define CREATE_TRACE_POINTS
++#include "avcrt-spf-trace.h"
++
+ /* Define IPC Logging Macros */
+ #define AUDIO_PKT_IPC_LOG_PAGE_CNT 2
+ static void *audio_pkt_ilctxt;
+@@ -65,6 +71,196 @@ do {									      \
+ #define CHANNEL_NAME "adsp_apps"
+ #define MAX_PACKET_SIZE 4096
+ 
++/* Public AudioReach APM/VCPM wire IDs; never card, DSP instance, or VSID values. */
++#define AVCRT_APM_GRAPH_OPEN		0x01001000
++#define AVCRT_APM_GRAPH_CLOSE		0x01001004
++#define AVCRT_APM_SET_CFG		0x01001006
++#define AVCRT_APM_GET_CFG		0x01001007
++#define AVCRT_APM_SUB_GRAPH_LIST	0x08001005
++#define AVCRT_CODEC_DMA_INTF_CFG	0x08001063
++#define AVCRT_VCPM_VOICE_CONFIG		0x08001162
++#define AVCRT_VCPM_VSID			0x080011BC
++#define AVCRT_VCPM_TX_PP_CHANNEL_INFO	0x08001310
++#define AVCRT_VCPM_TAG_INFO		0x080011B2
++#define AVCRT_VOICE_ENCODER_TAG		0x08001177
++#define AVCRT_VOICE_TX_HPCM_TAG		0x08001179
++
++#include "avcrt-spf-voice.h"
++
++/* AudioReach shared-memory endpoint opcodes; trace only GPR headers. */
++static bool avcrt_spf_data_opcode(bool tx, u32 opcode)
++{
++	if (tx)
++		return opcode == 0x04001000 || /* write buffer */
++		       opcode == 0x04001003 || /* read buffer */
++		       opcode == 0x0400100A || /* write buffer v2 */
++		       opcode == 0x0400100B;   /* read buffer v2 */
++	return opcode == 0x05001000 || /* write done */
++	       opcode == 0x05001002 || /* read done */
++	       opcode == 0x05001004 || /* write done v2 */
++	       opcode == 0x05001005;   /* read done v2 */
++}
++
++/* Emit only encoder and TX HPCM tags, not arbitrary parameter data. */
++static void avcrt_trace_voice_tags(u32 token, const u8 *p, size_t len)
++{
++	u32 graphs, props, sgid, id, size, tags, i;
++
++	if (len < 4)
++		return;
++	graphs = get_unaligned_le32(p);
++	p += 4;
++	len -= 4;
++	while (graphs--) {
++		if (len < 8)
++			return;
++		sgid = get_unaligned_le32(p);
++		props = get_unaligned_le32(p + 4);
++		p += 8;
++		len -= 8;
++		while (props--) {
++			if (len < 8)
++				return;
++			id = get_unaligned_le32(p);
++			size = get_unaligned_le32(p + 4);
++			p += 8;
++			len -= 8;
++			if (size > len)
++				return;
++			if (id == AVCRT_VCPM_TAG_INFO && size >= 4) {
++				tags = get_unaligned_le32(p);
++				if (tags <= (size - 4) / 8) {
++					for (i = 0; i < tags; i++) {
++						const u8 *t = p + 4 + i * 8;
++						u32 tag = get_unaligned_le32(t);
++
++						if (tag == AVCRT_VOICE_TX_HPCM_TAG ||
++						    tag == AVCRT_VOICE_ENCODER_TAG)
++							trace_avcrt_spf_config(token, tag,
++									      get_unaligned_le32(t + 4), sgid, 0, 0);
++					}
++				}
++			}
++			p += size;
++			len -= size;
++		}
++	}
++}
++
++static void avcrt_trace_spf_config(u32 token, u32 opcode, u32 peer,
++				   const u8 *p, size_t len)
++{
++	u32 miid, id, size, error, step;
++
++	/* APM command header: only documented in-band parameters, never DMA. */
++	if (len < 16 || get_unaligned_le32(p) || get_unaligned_le32(p + 4) ||
++	    get_unaligned_le32(p + 8))
++		return;
++	if (get_unaligned_le32(p + 12) > len - 16)
++		return;
++	len = get_unaligned_le32(p + 12);
++	p += 16;
++	while (len >= 16) {
++		miid = get_unaligned_le32(p);
++		id = get_unaligned_le32(p + 4);
++		size = get_unaligned_le32(p + 8);
++		error = get_unaligned_le32(p + 12);
++		p += 16;
++		len -= 16;
++		if (size > len)
++			return;
++		step = ALIGN(size, 8);
++		if (step > len)
++			return;
++		if (id == AVCRT_APM_SUB_GRAPH_LIST && size >= 4) {
++			u32 n = get_unaligned_le32(p), i;
++
++			if (n <= (size - 4) / 4)
++				for (i = 0; i < n; i++)
++					trace_avcrt_spf_config(token, id, miid,
++							      get_unaligned_le32(p + 4 + i * 4), 0, 0);
++		} else if (id == AVCRT_VCPM_VOICE_CONFIG) {
++			trace_avcrt_spf_config(token, id, miid, size, 0, 0);
++			avcrt_trace_voice_tags(token, p, size);
++		} else if (id == AVCRT_VCPM_TX_PP_CHANNEL_INFO &&
++			   opcode == AVCRT_APM_SET_CFG && !error &&
++			   peer == AVCRT_VCPM_PORT && miid == AVCRT_VCPM_PORT &&
++			   size == 8 && get_unaligned_le32(p) && get_unaligned_le32(p + 4)) {
++			/* VSID and channel count, not a VSID SET or a graph ownership ACK. */
++			trace_avcrt_spf_config(token, id, miid, get_unaligned_le32(p),
++					      get_unaligned_le32(p + 4), 0);
++		} else if (id == AVCRT_VCPM_VSID && size == 4)
++			trace_avcrt_spf_config(token, id, miid, get_unaligned_le32(p), 0, 0);
++		else if (id == AVCRT_CODEC_DMA_INTF_CFG && size == 12)
++			trace_avcrt_spf_config(token, id, miid, get_unaligned_le32(p),
++					      get_unaligned_le32(p + 4), get_unaligned_le32(p + 8));
++		else if (id == AVCRT_USB_AUDIO_INTF_CFG && opcode == AVCRT_APM_SET_CFG &&
++			 miid && peer == miid && !error && size == 8)
++			trace_avcrt_spf_config(token, id, miid, get_unaligned_le32(p),
++					      get_unaligned_le32(p + 4), 0);
++		p += step;
++		len -= step;
++	}
++}
++
++static void avcrt_trace_audio_pkt(bool tx, const struct gpr_hdr *hdr, size_t len,
++				 int transport_ret)
++{
++	u32 opcode, type, token, hdr_size, pkt_size, reply_opcode = 0;
++	const u8 *payload;
++	size_t payload_size;
++	s32 status = transport_ret;
++
++	if (!trace_avcrt_spf_packet_enabled() && !trace_avcrt_spf_config_enabled() &&
++	    !trace_avcrt_spf_apm_enabled() && !trace_avcrt_spf_data_enabled())
++		return;
++	if (len < sizeof(*hdr))
++		return;
++	hdr_size = GPR_PKT_GET_HEADER_BYTE_SIZE(hdr->header);
++	pkt_size = GPR_PKT_GET_PACKET_BYTE_SIZE(hdr->header);
++	if (hdr_size < sizeof(*hdr) || hdr_size > pkt_size || pkt_size > len ||
++	    pkt_size > MAX_PACKET_SIZE)
++		return;
++	opcode = hdr->opcode;
++	type = (opcode & MM_GUID_TYPE_MASK) >> MM_GUID_TYPE_SHIFT;
++	if (trace_avcrt_spf_data_enabled() && avcrt_spf_data_opcode(tx, opcode)) {
++		trace_avcrt_spf_data(tx, hdr->src_domain_id, hdr->dst_domain_id,
++				     hdr->src_port, hdr->dst_port, hdr->token,
++				     opcode, transport_ret);
++		return;
++	}
++	if (type < MM_GUID_TYPE_CONTROL_CMD || type > MM_GUID_TYPE_CONTROL_EVENT)
++		return;
++	token = hdr->token;
++	payload = (const u8 *)hdr + hdr_size;
++	payload_size = pkt_size - hdr_size;
++	if (!tx && opcode == GPR_IBASIC_RSP_RESULT && payload_size >= 8) {
++		reply_opcode = get_unaligned_le32(payload);
++		status = get_unaligned_le32(payload + 4);
++	}
++	trace_avcrt_spf_packet(tx, hdr->src_domain_id, hdr->dst_domain_id, hdr->src_port,
++			       hdr->dst_port, token, opcode, pkt_size, reply_opcode, status);
++	if (tx && trace_avcrt_spf_apm_enabled() && payload_size >= 16 &&
++	    ((opcode >= AVCRT_APM_GRAPH_OPEN && opcode <= AVCRT_APM_GRAPH_CLOSE) ||
++	     opcode == AVCRT_APM_SET_CFG || opcode == AVCRT_APM_GET_CFG)) {
++		bool shared = get_unaligned_le32(payload) ||
++			      get_unaligned_le32(payload + 4) ||
++			      get_unaligned_le32(payload + 8);
++		u32 declared = get_unaligned_le32(payload + 12);
++
++		/* No address or handle is exported, and shared memory is not mapped. */
++		trace_avcrt_spf_apm(hdr->src_domain_id, hdr->dst_domain_id,
++				    hdr->src_port, hdr->dst_port, token, opcode,
++				    shared, declared, (u32)payload_size - 16);
++	}
++	if (tx && transport_ret >= 0 && trace_avcrt_spf_config_enabled() &&
++	    ((opcode >= AVCRT_APM_GRAPH_OPEN && opcode <= AVCRT_APM_GRAPH_CLOSE) ||
++	     opcode == AVCRT_APM_SET_CFG))
++		avcrt_trace_spf_config(token, opcode, hdr->dst_port, payload, payload_size);
++}
++
++
++#include "avcrt-spf-usb-cut.h"
+ 
+ enum audio_pkt_state {
+ 	AUDIO_PKT_INIT,
+@@ -195,7 +391,11 @@ int audio_pkt_release(struct inode *inode, struct file *file)
+ 	spin_unlock_irqrestore(&audpkt_dev->queue_lock, flags);
+ 
+ 	file->private_data = NULL;
++	mutex_lock(&avcrt_cut_lock);
++	avcrt_cut_rollback(AVCRT_CUT_RELEASED);
++	avcrt_voice_reset();
+ 	spf_core_apm_close_all();
++	mutex_unlock(&avcrt_cut_lock);
+ 	msm_audio_ion_crash_handler();
+ 
+ 	return 0;
+@@ -340,7 +540,7 @@ ssize_t audio_pkt_write(struct file *file, const char __user *buf,
+ 	struct audio_pkt_device *audpkt_dev = NULL;
+ 	struct gpr_hdr *audpkt_hdr = NULL;
+ 	void *kbuf;
+-	int ret;
++	int ret, cut_slot;
+ 
+ 	if (file == NULL || file->private_data == NULL || buf == NULL) {
+ 		AUDIO_PKT_ERR("invalid parameters\n");
+@@ -372,6 +572,10 @@ ssize_t audio_pkt_write(struct file *file, const char __user *buf,
+ 		return PTR_ERR(kbuf);
+ 
+ 	audpkt_hdr = (struct gpr_hdr *) kbuf;
++	if (audpkt_hdr->src_port == AVCRT_CUT_PORT) {
++		ret = -EINVAL;
++		goto free_kbuf;
++	}
+ 
+ 	/* validate packet size */
+ 	if ((count > MAX_PACKET_SIZE) || (count < GPR_PKT_GET_PACKET_BYTE_SIZE(audpkt_hdr->header)))
+@@ -393,17 +597,35 @@ ssize_t audio_pkt_write(struct file *file, const char __user *buf,
+ 		}
+ 	}
+ 
+-	if (mutex_lock_interruptible(&audpkt_dev->lock)) {
++	if (mutex_lock_interruptible(&avcrt_cut_lock)) {
+ 		ret = -ERESTARTSYS;
+ 		goto free_kbuf;
+ 	}
++	if (!avcrt_cut_adev) {
++		ret = -ENETRESET;
++		goto unlock_cut;
++	}
++	if (mutex_lock_interruptible(&audpkt_dev->lock)) {
++		ret = -ERESTARTSYS;
++		goto unlock_cut;
++	}
+ 	if (count < sizeof(struct gpr_pkt )) {
+ 		AUDIO_PKT_ERR("Invalid count %zu\n", count);
+ 		ret = -EINVAL;
+ 		mutex_unlock(&audpkt_dev->lock);
+-		goto free_kbuf;
++		goto unlock_cut;
++	}
++	cut_slot = avcrt_cut_stock_before(audpkt_hdr);
++	/* Publish the pending request before an ACK can arrive on another CPU. */
++	avcrt_voice_observe(true, audpkt_hdr, count, false);
++	avcrt_usb_capture_tx(audpkt_hdr, false);
++	ret = gpr_send_pkt(avcrt_cut_adev, (struct gpr_pkt *)kbuf);
++	if (ret < 0) {
++		avcrt_usb_capture_tx(audpkt_hdr, true);
++		avcrt_cut_stock_failed(cut_slot);
++		avcrt_voice_observe(true, audpkt_hdr, count, true);
+ 	}
+-	ret = gpr_send_pkt(ap_priv->adev,(struct gpr_pkt *) kbuf);
++	avcrt_trace_audio_pkt(true, audpkt_hdr, count, ret < 0 ? ret : 0);
+ 	if (ret < 0) {
+ 		AUDIO_PKT_ERR("APR Send Packet Failed ret -%d\n", ret);
+ 		if (ret == -ECONNRESET)
+@@ -411,6 +633,8 @@ ssize_t audio_pkt_write(struct file *file, const char __user *buf,
+ 	}
+ 	mutex_unlock(&audpkt_dev->lock);
+ 
++unlock_cut:
++	mutex_unlock(&avcrt_cut_lock);
+ free_kbuf:
+ 	kfree(kbuf);
+ 	return ret < 0 ? ret : count;
+@@ -481,6 +705,12 @@ static int audio_pkt_srvc_callback(struct gpr_device *adev,
+     AUDIO_PKT_INFO("%s: header %d packet %d \n",
+ 		__func__,hdr_size, pkt_size);
+ 
++	avcrt_trace_audio_pkt(false, hdr, pkt_size, 0);
++	if (avcrt_cut_rx(hdr, pkt_size))
++		return 0;
++	avcrt_voice_observe(false, hdr, pkt_size, false);
++	avcrt_cut_stock_ack(hdr, pkt_size);
++	avcrt_usb_capture_ack(hdr, pkt_size);
+ 	skb = alloc_skb(pkt_size, GFP_ATOMIC);
+ 	if (!skb) {
+ 		AUDIO_PKT_ERR("[TF-STABILITY]:alloc skb pkt_size %d failed\n", pkt_size);
+@@ -518,6 +748,9 @@ static int audio_pkt_probe(struct gpr_device *adev)
+ 		mutex_unlock(&ap_priv->lock);
+ 
+ 		dev_set_drvdata(&adev->dev, ap_priv);
++		mutex_lock(&avcrt_cut_lock);
++		avcrt_cut_adev = adev;
++		mutex_unlock(&avcrt_cut_lock);
+ 
+ 		dev_dbg(&adev->dev, "%s: Driver[%s] Probed\n",
+ 		 __func__, adev->name);
+@@ -545,6 +778,11 @@ static int audio_pkt_probe(struct gpr_device *adev)
+  */
+ static int audio_pkt_remove(struct gpr_device *adev)
+ {
++	mutex_lock(&avcrt_cut_lock);
++	avcrt_cut_adev = NULL;
++	avcrt_cut_rollback(AVCRT_CUT_GPR_REMOVED);
++	avcrt_voice_reset();
++	mutex_unlock(&avcrt_cut_lock);
+ 	if(ap_priv)
+ 	{
+ 		mutex_lock(&ap_priv->lock);
+@@ -755,6 +993,7 @@ static int __init audio_pkt_init(void)
+ static void __exit audio_pkt_exit(void)
+ {
+ 	platform_driver_unregister(&audio_pkt_core_platform_driver);
++	cancel_delayed_work_sync(&avcrt_cut_timer);
+ }
+ module_init(audio_pkt_init);
+ module_exit(audio_pkt_exit);
+diff --git a/qcom/opensource/audio-kernel/ipc/avcrt-spf-trace.h b/qcom/opensource/audio-kernel/ipc/avcrt-spf-trace.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..83fe3ef2060b72bd91d7402b7937d321cd0cd6fe
+--- /dev/null
++++ b/qcom/opensource/audio-kernel/ipc/avcrt-spf-trace.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM avcrt_spf
++
++#if !defined(_AVCRT_SPF_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _AVCRT_SPF_TRACE_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(avcrt_spf_packet,
++	TP_PROTO(bool tx, u8 src_domain, u8 dst_domain, u32 src_port, u32 dst_port,
++		 u32 token, u32 opcode, u32 bytes, u32 reply_opcode, s32 status),
++	TP_ARGS(tx, src_domain, dst_domain, src_port, dst_port, token, opcode, bytes,
++		reply_opcode, status),
++	TP_STRUCT__entry(
++		__field(bool, tx)
++		__field(u8, src_domain)
++		__field(u8, dst_domain)
++		__field(u32, src_port)
++		__field(u32, dst_port)
++		__field(u32, token)
++		__field(u32, opcode)
++		__field(u32, bytes)
++		__field(u32, reply_opcode)
++		__field(s32, status)
++	),
++	TP_fast_assign(
++		__entry->tx = tx;
++		__entry->src_domain = src_domain;
++		__entry->dst_domain = dst_domain;
++		__entry->src_port = src_port;
++		__entry->dst_port = dst_port;
++		__entry->token = token;
++		__entry->opcode = opcode;
++		__entry->bytes = bytes;
++		__entry->reply_opcode = reply_opcode;
++		__entry->status = status;
++	),
++	TP_printk("%s %u:%08x->%u:%08x token=%08x op=%08x bytes=%u reply_op=%08x status=%d",
++		  __entry->tx ? "TX" : "RX", __entry->src_domain, __entry->src_port,
++		  __entry->dst_domain, __entry->dst_port, __entry->token, __entry->opcode,
++		  __entry->bytes, __entry->reply_opcode, __entry->status)
++);
++
++TRACE_EVENT(avcrt_spf_config,
++	TP_PROTO(u32 token, u32 id, u32 miid, u32 value0, u32 value1, u32 value2),
++	TP_ARGS(token, id, miid, value0, value1, value2),
++	TP_STRUCT__entry(
++		__field(u32, token)
++		__field(u32, id)
++		__field(u32, miid)
++		__field(u32, value0)
++		__field(u32, value1)
++		__field(u32, value2)
++	),
++	TP_fast_assign(
++		__entry->token = token;
++		__entry->id = id;
++		__entry->miid = miid;
++		__entry->value0 = value0;
++		__entry->value1 = value1;
++		__entry->value2 = value2;
++	),
++	TP_printk("token=%08x id=%08x miid=%08x value0=%08x value1=%08x value2=%08x",
++		  __entry->token, __entry->id, __entry->miid, __entry->value0,
++		  __entry->value1, __entry->value2)
++);
++
++TRACE_EVENT(avcrt_spf_apm,
++	TP_PROTO(u8 src_domain, u8 dst_domain, u32 src_port, u32 dst_port,
++		 u32 token, u32 opcode, bool shared, u32 declared, u32 inline_bytes),
++	TP_ARGS(src_domain, dst_domain, src_port, dst_port, token, opcode,
++		shared, declared, inline_bytes),
++	TP_STRUCT__entry(
++		__field(u8, src_domain)
++		__field(u8, dst_domain)
++		__field(u32, src_port)
++		__field(u32, dst_port)
++		__field(u32, token)
++		__field(u32, opcode)
++		__field(bool, shared)
++		__field(u32, declared)
++		__field(u32, inline_bytes)
++	),
++	TP_fast_assign(
++		__entry->src_domain = src_domain;
++		__entry->dst_domain = dst_domain;
++		__entry->src_port = src_port;
++		__entry->dst_port = dst_port;
++		__entry->token = token;
++		__entry->opcode = opcode;
++		__entry->shared = shared;
++		__entry->declared = declared;
++		__entry->inline_bytes = inline_bytes;
++	),
++	TP_printk("%u:%08x->%u:%08x token=%08x op=%08x shared=%u declared=%u inline=%u",
++		  __entry->src_domain, __entry->src_port, __entry->dst_domain,
++		  __entry->dst_port, __entry->token, __entry->opcode, __entry->shared,
++		  __entry->declared, __entry->inline_bytes)
++);
++
++TRACE_EVENT(avcrt_spf_data,
++	TP_PROTO(bool tx, u8 src_domain, u8 dst_domain, u32 src_port, u32 dst_port,
++		 u32 token, u32 opcode, s32 transport_ret),
++	TP_ARGS(tx, src_domain, dst_domain, src_port, dst_port, token, opcode, transport_ret),
++	TP_STRUCT__entry(
++		__field(bool, tx)
++		__field(u8, src_domain)
++		__field(u8, dst_domain)
++		__field(u32, src_port)
++		__field(u32, dst_port)
++		__field(u32, token)
++		__field(u32, opcode)
++		__field(s32, transport_ret)
++	),
++	TP_fast_assign(
++		__entry->tx = tx;
++		__entry->src_domain = src_domain;
++		__entry->dst_domain = dst_domain;
++		__entry->src_port = src_port;
++		__entry->dst_port = dst_port;
++		__entry->token = token;
++		__entry->opcode = opcode;
++		__entry->transport_ret = transport_ret;
++	),
++	TP_printk("%s %u:%08x->%u:%08x token=%08x op=%08x transport_ret=%d",
++		  __entry->tx ? "TX" : "RX", __entry->src_domain, __entry->src_port,
++		  __entry->dst_domain, __entry->dst_port, __entry->token, __entry->opcode,
++		  __entry->transport_ret)
++);
++
++#endif
++
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH .
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE avcrt-spf-trace
++#include <trace/define_trace.h>
+diff --git a/qcom/opensource/audio-kernel/ipc/avcrt-spf-tx.h b/qcom/opensource/audio-kernel/ipc/avcrt-spf-tx.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d98d0a8e45d7513b7a2009d29eb5a0a8adf7fa0
+--- /dev/null
++++ b/qcom/opensource/audio-kernel/ipc/avcrt-spf-tx.h
+@@ -0,0 +1,269 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AVCRT_SPF_TX_H
++#define AVCRT_SPF_TX_H
++
++/* Passive companion-leg metadata, protected by avcrt_voice_lock. */
++#define AVCRT_LPAIF_RXTX 1
++#define AVCRT_TX_CFG_WINDOW_MS 1000
++#define AVCRT_USB_AUDIO_INTF_CFG 0x080010D6
++#define AVCRT_USB_CAPTURE 1
++#define AVCRT_USB_TX_MAX_SUBGRAPHS 8
++
++enum avcrt_tx_kind {
++	AVCRT_TX_UNKNOWN,
++	AVCRT_TX_CODEC,
++	AVCRT_TX_USB,
++};
++
++struct avcrt_tx_endpoint {
++	u32 kind, miid, a, b;
++};
++
++struct avcrt_tx_subgraphs {
++	u32 count, ids[AVCRT_USB_TX_MAX_SUBGRAPHS];
++};
++
++struct avcrt_tx_leg {
++	struct avcrt_tx_endpoint endpoint, proposed;
++	struct avcrt_tx_subgraphs subgraphs;
++	unsigned long until, started_at, configured_at;
++	u64 generation;
++	u32 port, vsid, proposed_vsid, token, pending, peer;
++	bool started;
++};
++
++static struct avcrt_tx_leg avcrt_tx_legs[8];
++static bool avcrt_tx_overflow;
++static u64 avcrt_tx_generation;
++
++static bool avcrt_usb_cfg_valid(u32 token, u32 interval)
++{
++	/* PAL also sends 0 to use the USB endpoint's default interval. */
++	return (token & 0xff) == AVCRT_USB_CAPTURE &&
++	       (!interval || (interval >= 125 && interval <= 3276800));
++}
++
++/* Only an in-band START listing complete, distinct subgraphs is evidence. */
++static struct avcrt_tx_subgraphs avcrt_usb_start_subgraphs(const u8 *p, size_t len)
++{
++	struct avcrt_tx_subgraphs list = {};
++	u32 size, count;
++	unsigned int i, j;
++
++	if (len < 36 || get_unaligned_le32(p) || get_unaligned_le32(p + 4) ||
++	    get_unaligned_le32(p + 8) || get_unaligned_le32(p + 12) != len - 16 ||
++	    get_unaligned_le32(p + 16) != AVCRT_APM_PORT ||
++	    get_unaligned_le32(p + 20) != AVCRT_APM_SUB_GRAPH_LIST ||
++	    get_unaligned_le32(p + 28))
++		return list;
++	size = get_unaligned_le32(p + 24);
++	count = get_unaligned_le32(p + 32);
++	if (!count || count > ARRAY_SIZE(list.ids) || size != 4 + 4 * count ||
++	    len != 32 + ALIGN(size, 8))
++		return list;
++	for (i = 0; i < count; i++) {
++		u32 sg = get_unaligned_le32(p + 36 + 4 * i);
++
++		if (!sg)
++			return list;
++		for (j = 0; j < i; j++)
++			if (list.ids[j] == sg)
++				return list;
++		list.ids[i] = sg;
++	}
++	list.count = count;
++	return list;
++}
++
++/* Recognize only in-band config. No shared memory, audio or DSP queries. */
++static void avcrt_tx_config(const u8 *p, size_t len, u32 peer,
++			    struct avcrt_tx_endpoint *endpoint, u32 *vsid)
++{
++	u32 miid, id, size;
++	size_t step;
++	unsigned int endpoints = 0, identities = 0;
++
++	if (len < 16 || get_unaligned_le32(p) || get_unaligned_le32(p + 4) ||
++	    get_unaligned_le32(p + 8) || get_unaligned_le32(p + 12) > len - 16)
++		return;
++	len = get_unaligned_le32(p + 12);
++	p += 16;
++	while (len >= 16) {
++		miid = get_unaligned_le32(p);
++		id = get_unaligned_le32(p + 4);
++		size = get_unaligned_le32(p + 8);
++		if (size > len - 16)
++			break;
++		step = 16 + ALIGN(size, 8);
++		if (step > len)
++			break;
++		if (id == AVCRT_CODEC_DMA_INTF_CFG || id == AVCRT_USB_AUDIO_INTF_CFG) {
++			if (++endpoints != 1 || !miid || peer != miid ||
++			    size != (id == AVCRT_CODEC_DMA_INTF_CFG ? 12 : 8) ||
++			    get_unaligned_le32(p + 12))
++				break;
++			/* Even non-TX config can invalidate a previously tracked endpoint. */
++			endpoint->miid = miid;
++			if (id == AVCRT_CODEC_DMA_INTF_CFG) {
++				endpoint->a = get_unaligned_le32(p + 20);
++				endpoint->b = get_unaligned_le32(p + 24);
++				if (get_unaligned_le32(p + 16) == AVCRT_LPAIF_RXTX &&
++				    endpoint->a && endpoint->b && endpoint->b <= 0xffff)
++					endpoint->kind = AVCRT_TX_CODEC;
++			} else {
++				endpoint->a = get_unaligned_le32(p + 16);
++				endpoint->b = get_unaligned_le32(p + 20);
++				if (avcrt_usb_cfg_valid(endpoint->a, endpoint->b))
++					endpoint->kind = AVCRT_TX_USB;
++			}
++		} else if ((id == AVCRT_VCPM_TX_PP_CHANNEL_INFO || id == AVCRT_VCPM_VSID) &&
++			   miid == AVCRT_VCPM_PORT) {
++			if ((id == AVCRT_VCPM_TX_PP_CHANNEL_INFO && peer == AVCRT_VCPM_PORT &&
++			     size == 8 && get_unaligned_le32(p + 20)) ||
++			    (id == AVCRT_VCPM_VSID && peer == AVCRT_APM_PORT && size == 4)) {
++				if (++identities != 1 || get_unaligned_le32(p + 12))
++					break;
++				*vsid = get_unaligned_le32(p + 16);
++			}
++		}
++		len -= step;
++		p += step;
++	}
++	if (len) {
++		/* Discard all claims from a malformed packet. */
++		*endpoint = (struct avcrt_tx_endpoint){ .miid = endpoint->miid };
++		*vsid = 0;
++	}
++}
++
++static void avcrt_tx_observe(bool send, bool failed, u32 port, u32 peer, u32 op,
++			     u32 token, u32 status, struct avcrt_tx_endpoint endpoint,
++			     u32 vsid, const struct avcrt_tx_subgraphs *subgraphs,
++			     unsigned long now)
++{
++	struct avcrt_tx_leg *leg = NULL, *free = NULL;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(avcrt_tx_legs); i++) {
++		struct avcrt_tx_leg *v = &avcrt_tx_legs[i];
++
++		if (v->port && !v->started && !time_before(now, v->until))
++			memset(v, 0, sizeof(*v));
++		if (v->port == port)
++			leg = v;
++		else if (!v->port && !free)
++			free = v;
++	}
++	if (!send || failed) {
++		if (!leg || leg->pending != op || leg->peer != peer || leg->token != token)
++			return;
++		if (failed || status) {
++			memset(leg, 0, sizeof(*leg));
++			return;
++		}
++		leg->pending = 0;
++		if (op == AVCRT_APM_GRAPH_START) {
++			leg->started = true;
++			leg->started_at = now;
++			leg->generation = ++avcrt_tx_generation;
++		} else {
++			if (leg->proposed.miid)
++				leg->endpoint = leg->proposed;
++			if (leg->proposed_vsid)
++				leg->vsid = leg->proposed_vsid;
++			memset(&leg->proposed, 0, sizeof(leg->proposed));
++			leg->proposed_vsid = 0;
++		}
++		return;
++	}
++	if (peer == AVCRT_APM_PORT && (op == AVCRT_APM_GRAPH_STOP ||
++	    op == AVCRT_APM_GRAPH_CLOSE || op == AVCRT_APM_GRAPH_OPEN ||
++	    (op == AVCRT_APM_GRAPH_PREPARE && leg && leg->started))) {
++		if (leg)
++			memset(leg, 0, sizeof(*leg));
++		return;
++	}
++	if (peer == AVCRT_APM_PORT && op == AVCRT_APM_GRAPH_START) {
++		if (!leg)
++			return;
++		if (leg->pending || leg->started || !leg->vsid || !leg->endpoint.kind) {
++			memset(leg, 0, sizeof(*leg));
++			return;
++		}
++		if (leg->endpoint.kind == AVCRT_TX_USB)
++			leg->subgraphs = *subgraphs;
++	} else if (op == AVCRT_APM_SET_CFG && (vsid || endpoint.miid)) {
++		if (leg && (leg->started || leg->pending ||
++		    (leg->vsid && vsid && leg->vsid != vsid) ||
++		    (leg->endpoint.miid && endpoint.miid &&
++		     memcmp(&leg->endpoint, &endpoint, sizeof(endpoint))))) {
++			memset(leg, 0, sizeof(*leg));
++			return;
++		}
++		if (!leg) {
++			if (!vsid && !endpoint.kind)
++				return;
++			if (!free) {
++				avcrt_tx_overflow = true;
++				return;
++			}
++			leg = free;
++			leg->port = port;
++			leg->configured_at = now;
++			leg->until = now + msecs_to_jiffies(AVCRT_TX_CFG_WINDOW_MS);
++		}
++		leg->proposed = endpoint;
++		leg->proposed_vsid = vsid;
++	} else {
++		return;
++	}
++	leg->peer = peer;
++	leg->pending = op;
++	leg->token = token;
++}
++
++static void avcrt_tx_forget(u32 vsid)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(avcrt_tx_legs); i++) {
++		struct avcrt_tx_leg *leg = &avcrt_tx_legs[i];
++
++		if (leg->vsid == vsid || leg->proposed_vsid == vsid)
++			memset(leg, 0, sizeof(*leg));
++	}
++}
++
++static const struct avcrt_tx_leg *avcrt_tx_find(u32 voice_port, u32 vsid,
++					      unsigned long start, unsigned long now,
++					      bool retried, unsigned long rejected)
++{
++	const struct avcrt_tx_leg *result = NULL;
++	unsigned long window = msecs_to_jiffies(AVCRT_TX_CFG_WINDOW_MS);
++	unsigned int i;
++
++	if (!vsid || avcrt_tx_overflow)
++		return result;
++	for (i = 0; i < ARRAY_SIZE(avcrt_tx_legs); i++) {
++		const struct avcrt_tx_leg *leg = &avcrt_tx_legs[i];
++
++		if (leg->port == voice_port ||
++		    (leg->vsid != vsid && leg->proposed_vsid != vsid))
++			continue;
++		if (!leg->started) {
++			if (time_before(now, leg->until) &&
++			    (leg->endpoint.kind || leg->proposed.kind))
++				return NULL;
++			continue;
++		}
++		/* Don't adopt a different or older leg based on VSID alone. */
++		if (result || (retried && !time_before(rejected, leg->configured_at)) ||
++		    !time_before(leg->started_at, start + window) ||
++		    !time_before(start, leg->started_at + window))
++			return NULL;
++		result = leg;
++	}
++	return result;
++}
++
++#endif
+diff --git a/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut-wire.h b/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut-wire.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6bb749ff8d509da08570eb939f4f081e6ad9784
+--- /dev/null
++++ b/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut-wire.h
+@@ -0,0 +1,86 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AVCRT_SPF_USB_CUT_WIRE_H
++#define AVCRT_SPF_USB_CUT_WIRE_H
++
++#define AVCRT_CUT_PORT 0x3ff0 /* Private AP test port, not a DSP instance. */
++#define AVCRT_CUT_MASTER_MUTE 0x08001036
++#define AVCRT_CUT_GET_RSP 0x02001000
++#define AVCRT_CUT_MS 200
++#define AVCRT_CUT_REPLY_MS 25
++
++struct avcrt_cut_pkt {
++	struct gpr_hdr h;
++	u32 payload[10];
++};
++
++static struct avcrt_cut_pkt avcrt_cut_request(u32 miid, u32 token, bool set, u32 value)
++{
++	return (struct avcrt_cut_pkt) {
++		.h = {
++			.header = (sizeof(struct avcrt_cut_pkt) << 8) |
++				  (sizeof(struct gpr_hdr) << 2),
++			.src_domain_id = GPR_IDS_DOMAIN_ID_APPS_V,
++			.dst_domain_id = GPR_IDS_DOMAIN_ID_ADSP_V,
++			.src_port = AVCRT_CUT_PORT, .dst_port = miid, .token = token,
++			.opcode = set ? AVCRT_APM_SET_CFG : AVCRT_APM_GET_CFG,
++		},
++		.payload = { 0, 0, 0, 24, miid, AVCRT_CUT_MASTER_MUTE, 4, 0, value, 0 },
++	};
++}
++
++/* An ACK does not replace the separate GET. Check the full reply envelope. */
++static int avcrt_cut_reply(const struct gpr_hdr *h, size_t len, const struct gpr_hdr *req)
++{
++	const u8 *p = (const u8 *)(h + 1);
++
++	if (len < sizeof(*h) || GPR_PKT_GET_HEADER_BYTE_SIZE(h->header) != sizeof(*h) ||
++	    GPR_PKT_GET_PACKET_BYTE_SIZE(h->header) != len || h->dst_port != req->src_port ||
++	    h->src_port != req->dst_port || h->token != req->token ||
++	    h->src_domain_id != req->dst_domain_id || h->dst_domain_id != req->src_domain_id)
++		return -EPROTO;
++	len -= sizeof(*h);
++	if (h->opcode == GPR_IBASIC_RSP_RESULT && len == 8 &&
++	    get_unaligned_le32(p) == req->opcode) {
++		if (get_unaligned_le32(p + 4))
++			return -EREMOTEIO;
++		return req->opcode == AVCRT_APM_SET_CFG ? 0 : -EPROTO;
++	}
++	if (req->opcode != AVCRT_APM_GET_CFG || h->opcode != AVCRT_CUT_GET_RSP ||
++	    (len != 24 && len != 28) || get_unaligned_le32(p + 4) != req->dst_port ||
++	    get_unaligned_le32(p + 8) != AVCRT_CUT_MASTER_MUTE || get_unaligned_le32(p + 12) != 4)
++		return -EPROTO;
++	if (get_unaligned_le32(p) || get_unaligned_le32(p + 16))
++		return -EREMOTEIO;
++	return get_unaligned_le32(p + 20) <= 1 ? (int)get_unaligned_le32(p + 20) : -EPROTO;
++}
++
++/* The same functions are exercised with a fake transport on the host. */
++typedef int (*avcrt_cut_io)(bool set, u32 value);
++
++static int avcrt_cut_change(avcrt_cut_io io, u32 value)
++{
++	int rc = io(true, value);
++
++	if (rc < 0)
++		return rc;
++	rc = io(false, U32_MAX);
++	return rc < 0 ? rc : (u32)rc == value ? 0 : -EIO;
++}
++
++static int avcrt_cut_restore(avcrt_cut_io io, bool (*still_bound)(void))
++{
++	/* A lost SET ACK can still be resolved by a fresh GET of the baseline. */
++	int rc = io(true, 0);
++	int value = io(false, U32_MAX);
++
++	/* One recovery retry if DSP explicitly reports it is still muted. */
++	if (value == 1 && still_bound()) {
++		rc = io(true, 0);
++		value = io(false, U32_MAX);
++	}
++	if (value == 0)
++		return 0;
++	return rc < 0 ? rc : value < 0 ? value : -EIO;
++}
++
++#endif
+diff --git a/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut.h b/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa770dac247b927bd2b54e67e55145be8c3103ef
+--- /dev/null
++++ b/qcom/opensource/audio-kernel/ipc/avcrt-spf-usb-cut.h
+@@ -0,0 +1,529 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AVCRT_SPF_USB_CUT_H
++#define AVCRT_SPF_USB_CUT_H
++
++#include "avcrt-spf-usb-cut-wire.h"
++
++/* Only MASTER_MUTE on a bound USB stock TX device stage. */
++enum avcrt_cut_state {
++	AVCRT_CUT_IDLE,
++	AVCRT_CUT_ACTIVE,
++	AVCRT_CUT_RESTORED,
++	AVCRT_CUT_UNVERIFIED,
++};
++
++enum avcrt_cut_reason {
++	AVCRT_CUT_EXPIRED = 1,
++	AVCRT_CUT_GRAPH_CHANGE,
++	AVCRT_CUT_APPLY_FAILED,
++	AVCRT_CUT_RELEASED,
++	AVCRT_CUT_GPR_REMOVED,
++};
++
++struct avcrt_cut_binding {
++	u64 epoch, generation;
++	u32 vsid, source, usb_token, interval, source_sg, cutoff_sg, miid;
++};
++
++/* Acquired before the existing packet write mutex; never taken by RX. */
++static DEFINE_MUTEX(avcrt_cut_lock);
++static DEFINE_SPINLOCK(avcrt_cut_rx_lock);
++static DECLARE_COMPLETION(avcrt_cut_done);
++static struct gpr_hdr avcrt_cut_pending;
++static int avcrt_cut_reply_rc;
++static u32 avcrt_cut_sequence;
++static struct avcrt_cut_binding avcrt_cut_target;
++static enum avcrt_cut_state avcrt_cut_state;
++static enum avcrt_cut_reason avcrt_cut_reason;
++static int avcrt_cut_result;
++static u64 avcrt_cut_owner;
++static unsigned long avcrt_cut_deadline;
++static struct gpr_device *avcrt_cut_adev;
++static void avcrt_cut_expire(struct work_struct *work);
++static DECLARE_DELAYED_WORK(avcrt_cut_timer, avcrt_cut_expire);
++
++static bool avcrt_cut_bind(const struct avcrt_cut_binding *b)
++{
++	u64 epoch;
++	u32 vsid;
++	struct avcrt_tx_leg leg = avcrt_voice_tx_snapshot(&epoch, &vsid);
++	bool source = false, cutoff = false;
++	unsigned int i;
++
++	if (!vsid || b->epoch != epoch || b->vsid != vsid || !b->generation ||
++	    leg.generation != b->generation || leg.endpoint.kind != AVCRT_TX_USB ||
++	    leg.endpoint.miid != b->source || leg.endpoint.a != b->usb_token ||
++	    leg.endpoint.b != b->interval || !b->miid || b->miid == b->source ||
++	    b->source_sg == b->cutoff_sg)
++		return false;
++	for (i = 0; i < leg.subgraphs.count; i++) {
++		source |= leg.subgraphs.ids[i] == b->source_sg;
++		cutoff |= leg.subgraphs.ids[i] == b->cutoff_sg;
++	}
++	return source && cutoff;
++}
++
++static bool avcrt_cut_rx(const struct gpr_hdr *hdr, size_t len)
++{
++	unsigned long flags;
++	int rc;
++
++	if (hdr->dst_port != AVCRT_CUT_PORT)
++		return false;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	if (avcrt_cut_pending.token) {
++		rc = avcrt_cut_reply(hdr, len, &avcrt_cut_pending);
++		if (rc != -EPROTO) {
++			avcrt_cut_pending.token = 0;
++			avcrt_cut_reply_rc = rc;
++			complete(&avcrt_cut_done);
++		}
++	}
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return true; /* Including late replies: never enter the vendor RX queue. */
++}
++
++static int avcrt_cut_exchange(bool set, u32 value)
++{
++	struct avcrt_cut_pkt pkt;
++	unsigned long flags;
++	int rc;
++
++	if (!avcrt_cut_adev)
++		return -ENETRESET;
++	if (++avcrt_cut_sequence == 0)
++		++avcrt_cut_sequence;
++	pkt = avcrt_cut_request(avcrt_cut_target.miid, avcrt_cut_sequence, set, value);
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	reinit_completion(&avcrt_cut_done);
++	avcrt_cut_reply_rc = -ETIMEDOUT;
++	avcrt_cut_pending = pkt.h;
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++
++	rc = gpr_send_pkt(avcrt_cut_adev, (struct gpr_pkt *)&pkt);
++	avcrt_trace_audio_pkt(true, &pkt.h, sizeof(pkt), rc < 0 ? rc : 0);
++	if (rc == sizeof(pkt))
++		wait_for_completion_timeout(&avcrt_cut_done, msecs_to_jiffies(AVCRT_CUT_REPLY_MS));
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	avcrt_cut_pending.token = 0;
++	if (rc >= 0)
++		rc = rc == sizeof(pkt) ? avcrt_cut_reply_rc : -EIO;
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return rc;
++}
++
++static bool avcrt_cut_still_bound(void)
++{
++	return avcrt_cut_bind(&avcrt_cut_target);
++}
++
++static void avcrt_cut_rollback(enum avcrt_cut_reason reason)
++{
++	if (avcrt_cut_state != AVCRT_CUT_ACTIVE)
++		return;
++	avcrt_cut_reason = reason;
++	/* No blind SET into a different generation. Do not call idle "clean". */
++	avcrt_cut_result = avcrt_cut_still_bound() ?
++		avcrt_cut_restore(avcrt_cut_exchange, avcrt_cut_still_bound) : -ESTALE;
++	avcrt_cut_state = avcrt_cut_result ? AVCRT_CUT_UNVERIFIED : AVCRT_CUT_RESTORED;
++}
++
++static void avcrt_cut_expire(struct work_struct *work)
++{
++	unsigned long now;
++
++	mutex_lock(&avcrt_cut_lock);
++	now = jiffies;
++	if (avcrt_cut_state == AVCRT_CUT_ACTIVE) {
++		if (time_before(now, avcrt_cut_deadline))
++			schedule_delayed_work(&avcrt_cut_timer, avcrt_cut_deadline - now);
++		else
++			avcrt_cut_rollback(AVCRT_CUT_EXPIRED);
++	}
++	mutex_unlock(&avcrt_cut_lock);
++}
++
++static bool avcrt_cut_can_arm(const struct avcrt_cut_binding *b)
++{
++	return avcrt_cut_state != AVCRT_CUT_ACTIVE && avcrt_cut_state != AVCRT_CUT_UNVERIFIED &&
++	       b->generation > avcrt_cut_target.generation && avcrt_cut_bind(b);
++}
++
++/* Track stock lifecycle commands already in flight as well as new ones. */
++#define AVCRT_APM_GRAPH_FLUSH   0x01001005
++#define AVCRT_APM_GRAPH_SUSPEND 0x01001043
++
++struct avcrt_cut_flight { u32 port, peer, token, op; };
++static struct avcrt_cut_flight avcrt_cut_flight[32];
++static bool avcrt_cut_flight_overflow;
++
++static bool avcrt_cut_graph(const struct gpr_hdr *h)
++{
++	return h->src_domain_id == GPR_IDS_DOMAIN_ID_APPS_V &&
++	       h->dst_domain_id == GPR_IDS_DOMAIN_ID_ADSP_V && h->dst_port == AVCRT_APM_PORT &&
++	       ((h->opcode <= AVCRT_APM_GRAPH_CLOSE && h->opcode >= AVCRT_APM_GRAPH_OPEN) ||
++		h->opcode == AVCRT_APM_CLOSE_ALL || h->opcode == AVCRT_APM_GRAPH_FLUSH ||
++		h->opcode == AVCRT_APM_GRAPH_SUSPEND);
++}
++
++static void avcrt_cut_stock_ack(const struct gpr_hdr *h, size_t len)
++{
++	unsigned long flags;
++	unsigned int i;
++
++	if (h->opcode != GPR_IBASIC_RSP_RESULT ||
++	    h->src_domain_id != GPR_IDS_DOMAIN_ID_ADSP_V ||
++	    h->dst_domain_id != GPR_IDS_DOMAIN_ID_APPS_V || len != sizeof(*h) + 8 ||
++	    GPR_PKT_GET_HEADER_BYTE_SIZE(h->header) != sizeof(*h))
++		return;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	for (i = 0; i < ARRAY_SIZE(avcrt_cut_flight); i++) {
++		struct avcrt_cut_flight *f = &avcrt_cut_flight[i];
++
++		if (f->op && f->port == h->dst_port && f->peer == h->src_port &&
++		    f->token == h->token && f->op == get_unaligned_le32((const u8 *)(h + 1))) {
++			f->op = 0;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++}
++
++static int avcrt_cut_stock_before(const struct gpr_hdr *h)
++{
++	const bool graph = avcrt_cut_graph(h);
++	const bool set = h->opcode == AVCRT_APM_SET_CFG &&
++		h->src_domain_id == GPR_IDS_DOMAIN_ID_APPS_V &&
++		h->dst_domain_id == GPR_IDS_DOMAIN_ID_ADSP_V;
++	unsigned long flags;
++	unsigned int i;
++
++	if (graph || (set &&
++	    (h->dst_port == AVCRT_APM_PORT || h->dst_port == AVCRT_VCPM_PORT ||
++	     h->dst_port == avcrt_cut_target.source || h->dst_port == avcrt_cut_target.miid)))
++		avcrt_cut_rollback(AVCRT_CUT_GRAPH_CHANGE);
++	if (!graph && !set)
++		return -1;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	for (i = 0; i < ARRAY_SIZE(avcrt_cut_flight); i++) {
++		if (!avcrt_cut_flight[i].op) {
++			avcrt_cut_flight[i] = (struct avcrt_cut_flight) {
++				h->src_port, h->dst_port, h->token, h->opcode,
++			};
++			break;
++		}
++	}
++	if (i == ARRAY_SIZE(avcrt_cut_flight))
++		avcrt_cut_flight_overflow = true;
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return i < ARRAY_SIZE(avcrt_cut_flight) ? (int)i : -1;
++}
++
++static void avcrt_cut_stock_failed(int slot)
++{
++	unsigned long flags;
++
++	if (slot < 0)
++		return;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	avcrt_cut_flight[slot].op = 0;
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++}
++
++static bool avcrt_cut_stock_busy(void)
++{
++	unsigned long flags;
++	unsigned int i;
++	bool busy;
++
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	busy = avcrt_cut_flight_overflow;
++	for (i = 0; i < ARRAY_SIZE(avcrt_cut_flight); i++)
++		busy |= !!avcrt_cut_flight[i].op;
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return busy;
++}
++
++/* One private READ endpoint per worker. Observe metadata only; a Binder close
++ * result does not prove the underlying graph was stopped and closed by DSP.
++ * Kept under the RX lock so STOP/CLOSE replies need not enter the cut mutex.
++ */
++static struct {
++	u32 miid, port, token, op;
++	bool stopped, closed, failed, seen;
++} avcrt_usb_capture;
++
++static void avcrt_usb_capture_tx(const struct gpr_hdr *h, bool failed)
++{
++	unsigned long flags;
++
++	if (h->src_domain_id != GPR_IDS_DOMAIN_ID_APPS_V ||
++	    h->dst_domain_id != GPR_IDS_DOMAIN_ID_ADSP_V)
++		return;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	if (!avcrt_usb_capture.miid || avcrt_usb_capture.closed)
++		goto out;
++	if (h->dst_port == avcrt_usb_capture.miid &&
++	    (h->opcode == 0x04001003 || h->opcode == 0x0400100b)) {
++		/* Record before send; a failure still identifies the only graph port. */
++		if (avcrt_usb_capture.port && avcrt_usb_capture.port != h->src_port)
++			avcrt_usb_capture.failed = true;
++		avcrt_usb_capture.port = h->src_port;
++		avcrt_usb_capture.seen = true;
++	} else if (avcrt_usb_capture.port && h->src_port == avcrt_usb_capture.port &&
++		   h->dst_port == AVCRT_APM_PORT && (h->opcode == AVCRT_APM_GRAPH_STOP ||
++		   h->opcode == AVCRT_APM_GRAPH_CLOSE)) {
++		if (failed || avcrt_usb_capture.op)
++			avcrt_usb_capture.failed = true;
++		avcrt_usb_capture.token = h->token;
++		avcrt_usb_capture.op = h->opcode;
++	}
++out:
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++}
++
++static void avcrt_usb_capture_ack(const struct gpr_hdr *h, size_t len)
++{
++	unsigned long flags;
++	u32 op, status;
++
++	if (h->opcode != GPR_IBASIC_RSP_RESULT || len != sizeof(*h) + 8 ||
++	    GPR_PKT_GET_HEADER_BYTE_SIZE(h->header) != sizeof(*h) ||
++	    h->src_domain_id != GPR_IDS_DOMAIN_ID_ADSP_V ||
++	    h->dst_domain_id != GPR_IDS_DOMAIN_ID_APPS_V || h->src_port != AVCRT_APM_PORT)
++		return;
++	op = get_unaligned_le32((const u8 *)(h + 1));
++	status = get_unaligned_le32((const u8 *)(h + 1) + 4);
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	if (op && op == avcrt_usb_capture.op && h->dst_port == avcrt_usb_capture.port &&
++	    h->token == avcrt_usb_capture.token) {
++		avcrt_usb_capture.op = 0;
++		if (status)
++			avcrt_usb_capture.failed = true;
++		else if (op == AVCRT_APM_GRAPH_STOP)
++			avcrt_usb_capture.stopped = true;
++		else if (avcrt_usb_capture.stopped && !avcrt_usb_capture.failed)
++			avcrt_usb_capture.closed = true;
++	}
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++}
++
++static int avcrt_usb_capture_get(char *buf, const struct kernel_param *kp)
++{
++	unsigned long flags;
++	int len;
++
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	len = scnprintf(buf, PAGE_SIZE, "1 %u %u\n", avcrt_usb_capture.miid,
++			avcrt_usb_capture.failed ? 3 : avcrt_usb_capture.closed ? 2 : avcrt_usb_capture.seen ? 1 : 0);
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return len;
++}
++
++static int avcrt_usb_capture_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long flags;
++	u32 version, miid;
++	char extra;
++	int rc = 0;
++
++	if (sscanf(val, "%u %u %c", &version, &miid, &extra) != 2 || version != 1 || !miid)
++		return -EINVAL;
++	spin_lock_irqsave(&avcrt_cut_rx_lock, flags);
++	if (avcrt_usb_capture.failed || (avcrt_usb_capture.seen && !avcrt_usb_capture.closed)) {
++		rc = -EUCLEAN;
++	} else {
++		memset(&avcrt_usb_capture, 0, sizeof(avcrt_usb_capture));
++		avcrt_usb_capture.miid = miid;
++	}
++	spin_unlock_irqrestore(&avcrt_cut_rx_lock, flags);
++	return rc;
++}
++
++static const struct kernel_param_ops avcrt_usb_capture_ops = {
++	.get = avcrt_usb_capture_get,
++	.set = avcrt_usb_capture_set,
++};
++module_param_cb(avcrt_usb_capture_cleanup, &avcrt_usb_capture_ops, NULL, 0600);
++
++static int avcrt_cut_get(char *buf, const struct kernel_param *kp)
++{
++	int len;
++
++	mutex_lock(&avcrt_cut_lock);
++	len = scnprintf(buf, PAGE_SIZE, "1 %u %llu %u %llu %u %u %d\n",
++			avcrt_cut_state, (unsigned long long)avcrt_cut_target.epoch,
++			avcrt_cut_target.vsid, (unsigned long long)avcrt_cut_target.generation,
++			avcrt_cut_target.miid, avcrt_cut_reason, avcrt_cut_result);
++	mutex_unlock(&avcrt_cut_lock);
++	return len;
++}
++
++static bool avcrt_cut_fresh(u64 deadline)
++{
++	u64 now = ktime_get_ns();
++
++	return deadline > now && deadline - now <= 35000000;
++}
++
++static int avcrt_cut_arm(const struct avcrt_cut_binding *b, u64 owner, u64 fresh_until)
++{
++	int rc;
++
++	if (!avcrt_cut_adev || !avcrt_cut_bind(b))
++		return -ESTALE;
++	if (avcrt_cut_state == AVCRT_CUT_UNVERIFIED)
++		return -EUCLEAN;
++	if (avcrt_cut_state == AVCRT_CUT_ACTIVE || avcrt_cut_stock_busy())
++		return -EBUSY;
++	if (!owner && (!avcrt_cut_can_arm(b) || work_busy(&avcrt_cut_timer.work)))
++		return -EBUSY;
++	/* A nonce gets at most one attempt. A new worker must pass its own
++	 * live checks and prime a fresh ring, even on the same START.
++	 */
++	if (owner && owner == avcrt_cut_owner)
++		return -ESTALE;
++	if (owner && !avcrt_cut_fresh(fresh_until))
++		return -ETIME;
++	avcrt_cut_target = *b;
++	avcrt_cut_owner = owner;
++	avcrt_cut_state = AVCRT_CUT_IDLE;
++	avcrt_cut_reason = 0;
++	/* Accept only an unmuted baseline; never restore over an existing mute. */
++	rc = avcrt_cut_exchange(false, U32_MAX);
++	if (rc || !avcrt_cut_bind(b)) {
++		rc = rc < 0 ? rc : rc ? -EALREADY : -ESTALE;
++		avcrt_cut_result = rc;
++		return rc;
++	}
++	if (owner && !avcrt_cut_fresh(fresh_until))
++		return avcrt_cut_result = -ETIME;
++	avcrt_cut_result = 0;
++	avcrt_cut_state = AVCRT_CUT_ACTIVE;
++	avcrt_cut_deadline = jiffies + msecs_to_jiffies(AVCRT_CUT_MS);
++	/* A previously queued worker will run no later than this new deadline. */
++	schedule_delayed_work(&avcrt_cut_timer, msecs_to_jiffies(AVCRT_CUT_MS));
++	rc = avcrt_cut_change(avcrt_cut_exchange, 1);
++	if (rc || !avcrt_cut_bind(b)) {
++		if (!rc)
++			rc = -ESTALE;
++		avcrt_cut_rollback(AVCRT_CUT_APPLY_FAILED);
++	}
++	return rc;
++}
++
++static int avcrt_cut_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long long epoch, generation;
++	struct avcrt_cut_binding b;
++	unsigned int version;
++	char extra;
++	int rc;
++
++	if (sscanf(val, "%u %llu %u %llu %u %u %u %u %u %u %c", &version, &epoch, &b.vsid,
++		   &generation, &b.source, &b.usb_token, &b.interval, &b.source_sg,
++		   &b.cutoff_sg, &b.miid, &extra) != 10 || version != 1)
++		return -EINVAL;
++	b.epoch = epoch;
++	b.generation = generation;
++	mutex_lock(&avcrt_cut_lock);
++	rc = avcrt_cut_arm(&b, 0, 0);
++	mutex_unlock(&avcrt_cut_lock);
++	return rc;
++}
++
++static const struct kernel_param_ops avcrt_cut_ops = {
++	.get = avcrt_cut_get,
++	.set = avcrt_cut_set,
++};
++module_param_cb(avcrt_voice_usb_cut_test, &avcrt_cut_ops, NULL, 0600);
++MODULE_PARM_DESC(avcrt_voice_usb_cut_test, "AVCRT USB diagnostic one-shot mute, kernel expiry and confirmed readback");
++
++static int avcrt_cut_lease_get(char *buf, const struct kernel_param *kp)
++{
++	int len;
++
++	mutex_lock(&avcrt_cut_lock);
++	len = scnprintf(buf, PAGE_SIZE, "1 %u %llu %llu %u %llu %u %u %d\n",
++			avcrt_cut_state, (unsigned long long)avcrt_cut_owner,
++			(unsigned long long)avcrt_cut_target.epoch, avcrt_cut_target.vsid,
++			(unsigned long long)avcrt_cut_target.generation, avcrt_cut_target.miid,
++			avcrt_cut_reason, avcrt_cut_result);
++	mutex_unlock(&avcrt_cut_lock);
++	return len;
++}
++
++static int avcrt_cut_heartbeat(u64 owner, bool release, u64 fresh_until)
++{
++	unsigned long began = jiffies;
++	int rc;
++
++	if (owner != avcrt_cut_owner)
++		return -ESTALE;
++	if (avcrt_cut_state == AVCRT_CUT_UNVERIFIED)
++		return -EUCLEAN;
++	if (release) {
++		avcrt_cut_rollback(AVCRT_CUT_RELEASED);
++		return avcrt_cut_state == AVCRT_CUT_UNVERIFIED ? -EUCLEAN : 0;
++	}
++	if (avcrt_cut_state != AVCRT_CUT_ACTIVE)
++		return -ESTALE;
++	if (!time_before(began, avcrt_cut_deadline)) {
++		avcrt_cut_rollback(AVCRT_CUT_EXPIRED);
++		return -ESTALE;
++	}
++	if (!avcrt_cut_still_bound() || avcrt_cut_stock_busy()) {
++		avcrt_cut_rollback(AVCRT_CUT_GRAPH_CHANGE);
++		return -ESTALE;
++	}
++	if (!avcrt_cut_fresh(fresh_until))
++		return -ETIME;
++	/* Read the DSP again. Never resend SET 1 or extend after expiry. */
++	rc = avcrt_cut_exchange(false, U32_MAX);
++	if (rc != 1 || !avcrt_cut_still_bound() || !time_before(jiffies, avcrt_cut_deadline)) {
++		avcrt_cut_rollback(AVCRT_CUT_APPLY_FAILED);
++		return rc < 0 ? rc : -ESTALE;
++	}
++	if (!avcrt_cut_fresh(fresh_until))
++		return -ETIME;
++	avcrt_cut_deadline = began + msecs_to_jiffies(AVCRT_CUT_MS);
++	return 0;
++}
++
++static int avcrt_cut_lease_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long long owner, epoch, generation, fresh_until = 0;
++	struct avcrt_cut_binding b;
++	unsigned int version, op;
++	char extra;
++	int rc;
++
++	if (sscanf(val, "%u %u %llu", &version, &op, &owner) != 3 || version != 1 || !owner)
++		return -EINVAL;
++	if (op == 1) {
++		if (sscanf(val, "%u %u %llu %llu %u %llu %u %u %u %u %u %u %llu %c", &version, &op,
++			   &owner, &epoch, &b.vsid, &generation, &b.source, &b.usb_token, &b.interval,
++			   &b.source_sg, &b.cutoff_sg, &b.miid, &fresh_until, &extra) != 13)
++			return -EINVAL;
++		b.epoch = epoch;
++		b.generation = generation;
++	} else if (op == 2) {
++		if (sscanf(val, "%u %u %llu %llu %c", &version, &op, &owner, &fresh_until, &extra) != 4)
++			return -EINVAL;
++	} else if (op != 3 || sscanf(val, "%u %u %llu %c", &version, &op, &owner, &extra) != 3) {
++		return -EINVAL;
++	}
++	mutex_lock(&avcrt_cut_lock);
++	rc = op == 1 ? avcrt_cut_arm(&b, owner, fresh_until) : avcrt_cut_heartbeat(owner, op == 3, fresh_until);
++	mutex_unlock(&avcrt_cut_lock);
++	return rc;
++}
++
++static const struct kernel_param_ops avcrt_cut_lease_ops = {
++	.get = avcrt_cut_lease_get,
++	.set = avcrt_cut_lease_set,
++};
++module_param_cb(avcrt_voice_usb_cut_lease, &avcrt_cut_lease_ops, NULL, 0600);
++MODULE_PARM_DESC(avcrt_voice_usb_cut_lease, "AVCRT generation-bound USB TX mute lease with DSP readback");
++
++#endif
+diff --git a/qcom/opensource/audio-kernel/ipc/avcrt-spf-voice.h b/qcom/opensource/audio-kernel/ipc/avcrt-spf-voice.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cda28ed415080066e8b59bc437efaf8b56700dd
+--- /dev/null
++++ b/qcom/opensource/audio-kernel/ipc/avcrt-spf-voice.h
+@@ -0,0 +1,417 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AVCRT_SPF_VOICE_H
++#define AVCRT_SPF_VOICE_H
++
++#ifdef __KERNEL__
++#include <linux/jiffies.h>
++#endif
++
++/* Only included by audio-pkt.c. No DSP commands, handles or audio data. */
++#define AVCRT_APM_GRAPH_PREPARE 0x01001001
++#define AVCRT_APM_GRAPH_START 0x01001002
++#define AVCRT_APM_GRAPH_STOP  0x01001003
++#define AVCRT_APM_CLOSE_ALL   0x01001013
++#define AVCRT_APM_PORT       1
++#define AVCRT_VCPM_PORT      4
++#define AVCRT_VOICE_REROUTE_MS 1000
++
++#include "avcrt-spf-tx.h"
++
++enum avcrt_voice_reopen {
++	AVCRT_VOICE_STOPPED = 1,
++	AVCRT_VOICE_CLOSED,
++	AVCRT_VOICE_OPENED,
++};
++
++struct avcrt_voice_port {
++	u32 port, vsid, token, pending, rejected_token;
++	unsigned long recover_until, started_at, rejected_at;
++	u8 cfg_peer, reopen;
++	bool started, suspended, recovering, retried;
++};
++
++static DEFINE_SPINLOCK(avcrt_voice_lock);
++static struct avcrt_voice_port avcrt_voice_ports[8];
++static u64 avcrt_voice_epoch;
++static bool avcrt_voice_overflow;
++
++static bool avcrt_voice_expired(const struct avcrt_voice_port *entry, unsigned long now)
++{
++	return (entry->suspended || entry->recovering) &&
++	       !time_before(now, entry->recover_until);
++}
++
++static void avcrt_voice_clear_locked(void)
++{
++	memset(avcrt_voice_ports, 0, sizeof(avcrt_voice_ports));
++	memset(avcrt_tx_legs, 0, sizeof(avcrt_tx_legs));
++	avcrt_voice_epoch++;
++	avcrt_voice_overflow = false;
++	avcrt_tx_overflow = false;
++}
++
++static void avcrt_voice_reset(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&avcrt_voice_lock, flags);
++	avcrt_voice_clear_locked();
++	spin_unlock_irqrestore(&avcrt_voice_lock, flags);
++}
++
++static const struct avcrt_voice_port *avcrt_voice_find(unsigned long now)
++{
++	const struct avcrt_voice_port *voice = NULL;
++	unsigned int i;
++
++	if (avcrt_voice_overflow)
++		return NULL;
++	for (i = 0; i < ARRAY_SIZE(avcrt_voice_ports); i++) {
++		const struct avcrt_voice_port *v = &avcrt_voice_ports[i];
++
++		if (v->started) {
++			if (voice)
++				return NULL;
++			voice = v;
++		} else if (v->vsid && !avcrt_voice_expired(v, now)) {
++			/* A timeout cannot prove that the DSP discarded a candidate. */
++			return NULL;
++		}
++	}
++	return voice;
++}
++
++static int avcrt_voice_get(char *buf, const struct kernel_param *kp)
++{
++	const struct avcrt_voice_port *voice;
++	unsigned long flags;
++	u32 vsid;
++	u64 epoch;
++
++	spin_lock_irqsave(&avcrt_voice_lock, flags);
++	voice = avcrt_voice_find(jiffies);
++	vsid = voice ? voice->vsid : 0;
++	epoch = avcrt_voice_epoch;
++	spin_unlock_irqrestore(&avcrt_voice_lock, flags);
++	return scnprintf(buf, PAGE_SIZE, "1 %llu %u\n", (unsigned long long)epoch, vsid);
++}
++
++static const struct kernel_param_ops avcrt_voice_ops = { .get = avcrt_voice_get };
++module_param_cb(avcrt_voice_state, &avcrt_voice_ops, NULL, 0400);
++MODULE_PARM_DESC(avcrt_voice_state, "AVCRT voice snapshot: version epoch sole_started_vsid");
++
++static struct avcrt_tx_leg avcrt_voice_tx_snapshot(u64 *epoch, u32 *vsid)
++{
++	const struct avcrt_voice_port *voice;
++	const struct avcrt_tx_leg *leg;
++	struct avcrt_tx_leg snapshot = {};
++	unsigned long flags, now;
++
++	spin_lock_irqsave(&avcrt_voice_lock, flags);
++	now = jiffies;
++	voice = avcrt_voice_find(now);
++	*vsid = voice ? voice->vsid : 0;
++	if (voice) {
++		leg = avcrt_tx_find(voice->port, *vsid, voice->started_at, now,
++				    voice->retried, voice->rejected_at);
++		if (leg)
++			snapshot = *leg;
++	}
++	*epoch = avcrt_voice_epoch;
++	spin_unlock_irqrestore(&avcrt_voice_lock, flags);
++	return snapshot;
++}
++
++static int avcrt_voice_tx_get(char *buf, const struct kernel_param *kp)
++{
++	u64 epoch;
++	u32 vsid;
++	struct avcrt_tx_leg leg = avcrt_voice_tx_snapshot(&epoch, &vsid);
++
++	if (leg.endpoint.kind != AVCRT_TX_CODEC)
++		memset(&leg, 0, sizeof(leg));
++	return scnprintf(buf, PAGE_SIZE, "1 %llu %u %llu %u %u %u\n",
++			 (unsigned long long)epoch, vsid, (unsigned long long)leg.generation,
++			 leg.endpoint.miid, leg.endpoint.a, leg.endpoint.b);
++}
++
++static const struct kernel_param_ops avcrt_voice_tx_ops = { .get = avcrt_voice_tx_get };
++module_param_cb(avcrt_voice_tx, &avcrt_voice_tx_ops, NULL, 0400);
++MODULE_PARM_DESC(avcrt_voice_tx, "AVCRT TX snapshot: version epoch vsid generation codec_miid dma_index slots");
++
++static int avcrt_voice_tx_route_get(char *buf, const struct kernel_param *kp)
++{
++	u64 epoch;
++	u32 vsid;
++	const struct avcrt_tx_leg leg = avcrt_voice_tx_snapshot(&epoch, &vsid);
++
++	return scnprintf(buf, PAGE_SIZE, "1 %llu %u %llu %u %u %u %u\n",
++			 (unsigned long long)epoch, vsid, (unsigned long long)leg.generation,
++			 leg.endpoint.kind, leg.endpoint.miid, leg.endpoint.a, leg.endpoint.b);
++}
++
++static const struct kernel_param_ops avcrt_voice_tx_route_ops = { .get = avcrt_voice_tx_route_get };
++module_param_cb(avcrt_voice_tx_route, &avcrt_voice_tx_route_ops, NULL, 0400);
++MODULE_PARM_DESC(avcrt_voice_tx_route, "AVCRT route snapshot: version epoch vsid generation kind miid a b");
++
++static int avcrt_voice_usb_subgraphs_get(char *buf, const struct kernel_param *kp)
++{
++	u64 epoch;
++	u32 vsid;
++	struct avcrt_tx_leg leg = avcrt_voice_tx_snapshot(&epoch, &vsid);
++	unsigned int i;
++	int len;
++
++	if (leg.endpoint.kind != AVCRT_TX_USB || !leg.subgraphs.count)
++		memset(&leg, 0, sizeof(leg));
++	len = scnprintf(buf, PAGE_SIZE, "1 %llu %u %llu %u %u %u %u",
++			(unsigned long long)epoch, vsid, (unsigned long long)leg.generation,
++			leg.endpoint.miid, leg.endpoint.a, leg.endpoint.b, leg.subgraphs.count);
++	for (i = 0; i < leg.subgraphs.count; i++)
++		len += scnprintf(buf + len, PAGE_SIZE - len, " %u", leg.subgraphs.ids[i]);
++	return len + scnprintf(buf + len, PAGE_SIZE - len, "\n");
++}
++
++static const struct kernel_param_ops avcrt_voice_usb_subgraphs_ops = {
++	.get = avcrt_voice_usb_subgraphs_get,
++};
++module_param_cb(avcrt_voice_usb_subgraphs, &avcrt_voice_usb_subgraphs_ops, NULL, 0400);
++MODULE_PARM_DESC(avcrt_voice_usb_subgraphs, "AVCRT USB TX snapshot: version epoch vsid generation miid token interval count [subgraphs]");
++
++static u32 avcrt_voice_vsid(const u8 *p, size_t len)
++{
++	u32 vsid = 0, size;
++	size_t step;
++
++	if (len < 16 || get_unaligned_le32(p) || get_unaligned_le32(p + 4) ||
++	    get_unaligned_le32(p + 8) || get_unaligned_le32(p + 12) > len - 16)
++		return 0;
++	len = get_unaligned_le32(p + 12);
++	p += 16;
++	while (len >= 16) {
++		size = get_unaligned_le32(p + 8);
++		if (size > len - 16)
++			return 0;
++		step = 16 + ALIGN(size, 8);
++		if (step > len)
++			return 0;
++		if (get_unaligned_le32(p) == AVCRT_VCPM_PORT &&
++		    get_unaligned_le32(p + 4) == AVCRT_VCPM_VSID) {
++			if (size != 4 || vsid || get_unaligned_le32(p + 12))
++				return 0;
++			vsid = get_unaligned_le32(p + 16);
++			if (!vsid)
++				return 0;
++		}
++		len -= step;
++		p += step;
++	}
++	return len ? 0 : vsid;
++}
++
++static void avcrt_voice_observe(bool tx, const struct gpr_hdr *h, size_t len,
++			       bool failed)
++{
++	u32 header, bytes, port, peer, op, status = 0, vsid = 0;
++	u32 tx_vsid = 0;
++	struct avcrt_tx_endpoint endpoint = {};
++	struct avcrt_tx_subgraphs subgraphs = {};
++	struct avcrt_voice_port *entry = NULL, *free_entry = NULL;
++	unsigned long flags, now;
++	unsigned int i;
++	bool reroute, voice_event;
++	const u8 *p;
++
++	if (len < sizeof(*h) || len > MAX_PACKET_SIZE)
++		return;
++	header = GPR_PKT_GET_HEADER_BYTE_SIZE(h->header);
++	bytes = GPR_PKT_GET_PACKET_BYTE_SIZE(h->header);
++	if (header < sizeof(*h) || header > bytes || bytes > len)
++		return;
++	p = (const u8 *)h + header;
++	op = h->opcode;
++	if (tx) {
++		if (h->src_domain_id != GPR_IDS_DOMAIN_ID_APPS_V ||
++		    h->dst_domain_id != GPR_IDS_DOMAIN_ID_ADSP_V)
++			return;
++		port = h->src_port;
++		peer = h->dst_port;
++		if (op == AVCRT_APM_SET_CFG && !failed) {
++			avcrt_tx_config(p, bytes - header, peer, &endpoint, &tx_vsid);
++			if (peer == AVCRT_VCPM_PORT || peer == AVCRT_APM_PORT)
++				vsid = avcrt_voice_vsid(p, bytes - header);
++		}
++		if (op == AVCRT_APM_GRAPH_START && peer == AVCRT_APM_PORT && !failed)
++			subgraphs = avcrt_usb_start_subgraphs(p, bytes - header);
++	} else {
++		if (h->src_domain_id != GPR_IDS_DOMAIN_ID_ADSP_V ||
++		    h->dst_domain_id != GPR_IDS_DOMAIN_ID_APPS_V ||
++		    op != GPR_IBASIC_RSP_RESULT || bytes - header < 8)
++			return;
++		port = h->dst_port;
++		peer = h->src_port;
++		op = get_unaligned_le32(p);
++		status = get_unaligned_le32(p + 4);
++	}
++	voice_event = op == AVCRT_APM_SET_CFG ?
++		(peer == AVCRT_APM_PORT || peer == AVCRT_VCPM_PORT) && (!tx || failed || vsid) :
++		peer == AVCRT_APM_PORT &&
++		(op == AVCRT_APM_GRAPH_OPEN || op == AVCRT_APM_GRAPH_PREPARE ||
++		 op == AVCRT_APM_GRAPH_START || op == AVCRT_APM_GRAPH_STOP ||
++		 op == AVCRT_APM_GRAPH_CLOSE || op == AVCRT_APM_CLOSE_ALL);
++	if (!voice_event && (op != AVCRT_APM_SET_CFG ||
++	    (tx && !failed && !endpoint.miid && !tx_vsid)))
++		return;
++
++	spin_lock_irqsave(&avcrt_voice_lock, flags);
++	now = jiffies;
++	if (tx && !failed && op == AVCRT_APM_CLOSE_ALL) {
++		avcrt_voice_clear_locked();
++		goto out;
++	}
++	if (port)
++		avcrt_tx_observe(tx, failed, port, peer, op, h->token, status,
++				 endpoint, tx_vsid, &subgraphs, now);
++	if (!voice_event)
++		goto out;
++	for (i = 0; i < ARRAY_SIZE(avcrt_voice_ports); i++) {
++		struct avcrt_voice_port *v = &avcrt_voice_ports[i];
++
++		if (avcrt_voice_expired(v, now))
++			memset(v, 0, sizeof(*v));
++		if (v->vsid && v->port == port)
++			entry = v;
++		else if (!v->vsid && !free_entry)
++			free_entry = v;
++	}
++	if (tx && !failed && vsid) {
++		unsigned long recover_until = 0, rejected_at = 0;
++		u32 rejected_token = 0;
++		bool retried = false;
++
++		/*
++		 * APM can carry the VSID again when PAL replaces voice devices.
++		 * Only the previously confirmed voice port may use this as proof.
++		 * A second leg with the same VSID, or a new APM graph, cannot qualify.
++		 */
++		reroute = peer == AVCRT_APM_PORT;
++		if (reroute) {
++			if (!entry || !entry->suspended || entry->pending ||
++			    entry->reopen != AVCRT_VOICE_OPENED)
++				goto out;
++			if (vsid != entry->vsid) {
++				memset(entry, 0, sizeof(*entry));
++				goto out;
++			}
++			recover_until = entry->recover_until;
++			retried = entry->retried;
++			rejected_at = entry->rejected_at;
++			rejected_token = entry->rejected_token;
++		} else if (entry && entry->started) {
++			avcrt_tx_forget(entry->vsid);
++		}
++		entry = entry ?: free_entry;
++		avcrt_voice_epoch++;
++		if (!entry) {
++			avcrt_voice_overflow = true;
++			goto out;
++		}
++		*entry = (struct avcrt_voice_port) {
++			.port = port, .vsid = vsid, .token = h->token,
++			.pending = op, .cfg_peer = peer, .recovering = reroute,
++			.recover_until = recover_until, .retried = retried,
++			.rejected_at = rejected_at, .rejected_token = rejected_token,
++		};
++	} else if (entry && entry->suspended) {
++		if (tx && !failed && op != AVCRT_APM_SET_CFG) {
++			if (!entry->pending &&
++			    ((!entry->reopen && entry->retried &&
++			      op == AVCRT_APM_GRAPH_STOP) ||
++			     (entry->reopen == AVCRT_VOICE_STOPPED &&
++			      op == AVCRT_APM_GRAPH_CLOSE) ||
++			     (entry->reopen == AVCRT_VOICE_CLOSED &&
++			      op == AVCRT_APM_GRAPH_OPEN))) {
++				entry->pending = op;
++				entry->token = h->token;
++			} else {
++				memset(entry, 0, sizeof(*entry));
++			}
++		} else if (entry->pending == op && entry->token == h->token) {
++			if (status || failed)
++				memset(entry, 0, sizeof(*entry));
++			else {
++				entry->pending = 0;
++				entry->reopen++;
++			}
++		}
++	} else if (entry && tx && !failed &&
++		   (op == AVCRT_APM_GRAPH_STOP || op == AVCRT_APM_GRAPH_CLOSE ||
++		    op == AVCRT_APM_GRAPH_OPEN ||
++		    (op == AVCRT_APM_GRAPH_PREPARE && entry->started))) {
++		/*
++		 * Withdraw the generation before forwarding STOP. Remember only
++		 * its identity, never readiness, across the ensuing CLOSE/OPEN.
++		 */
++		if (entry->started)
++			avcrt_tx_forget(entry->vsid);
++		if (op == AVCRT_APM_GRAPH_STOP && entry->started) {
++			entry->started = false;
++			entry->suspended = true;
++			entry->reopen = 0;
++			entry->retried = false;
++			entry->pending = op;
++			entry->token = h->token;
++			entry->recover_until = now + msecs_to_jiffies(AVCRT_VOICE_REROUTE_MS);
++		} else {
++			memset(entry, 0, sizeof(*entry));
++		}
++		avcrt_voice_epoch++;
++	} else if (entry && tx && !failed && op == AVCRT_APM_GRAPH_START) {
++		if (entry->pending || (entry->recovering && entry->retried &&
++		    h->token == entry->rejected_token)) {
++			/* An overlapping START or reused rejected token cannot qualify. */
++			memset(entry, 0, sizeof(*entry));
++			avcrt_voice_epoch++;
++			goto out;
++		}
++		if (entry->started)
++			avcrt_tx_forget(entry->vsid);
++		entry->started = false;
++		entry->token = h->token;
++		entry->pending = op;
++		avcrt_voice_epoch++;
++	} else if (entry && entry->pending == op && entry->token == h->token &&
++		   (op != AVCRT_APM_SET_CFG || peer == entry->cfg_peer) &&
++		   (!tx || failed)) {
++		if (status && !failed && op == AVCRT_APM_GRAPH_START &&
++		    entry->recovering && !entry->retried) {
++			/*
++			 * PAL can tear down a rejected route and try it again.
++			 * Keep only the confirmed port/VSID, within the original
++			 * deadline. Require a full ACKed STOP/CLOSE/OPEN and new
++			 * config/START before publishing any readiness again.
++			 */
++			entry->pending = 0;
++			entry->recovering = false;
++			entry->suspended = true;
++			entry->reopen = 0;
++			entry->retried = true;
++			entry->rejected_at = now;
++			entry->rejected_token = h->token;
++		} else if (status || failed) {
++			memset(entry, 0, sizeof(*entry));
++		} else {
++			entry->pending = 0;
++			entry->started = op == AVCRT_APM_GRAPH_START;
++			if (entry->started) {
++				entry->recovering = false;
++				entry->started_at = now;
++			}
++		}
++		avcrt_voice_epoch++;
++	}
++out:
++	spin_unlock_irqrestore(&avcrt_voice_lock, flags);
++}
++
++#endif

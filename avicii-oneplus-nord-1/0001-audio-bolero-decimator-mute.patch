@@ -1,0 +1,60 @@
+# 0001-audio-bolero-decimator-mute.patch — AVCRT codec decimator mute control.
+# Adds the default-OFF "AVCRT Dec Mute" codec kcontrol (bitmask -> TXn_TX_PATH_CTL bit 0x10)
+# used by the avcrtd daemon to mute the call's modem-bound decimators for a clean voice replace.
+# Apply from kernel source root with git apply (after git apply --check).
+--- a/techpack/audio/asoc/codecs/bolero/tx-macro.c
++++ b/techpack/audio/asoc/codecs/bolero/tx-macro.c
+@@ -2395,7 +2395,53 @@
+ 			tx_macro_dec_mode_get, tx_macro_dec_mode_put),
+ };
+ 
++/*
++ * AVCRT experiment: force the digital MUTE bit (0x10) in TXn_TX_PATH_CTL for a
++ * bitmask of decimators. Unlike the broken "TX_DEC Volume" control (sticks at 256),
++ * this directly drives a codec register we own. Purpose: test whether muting the mic
++ * at the CODEC level gates the cellular modem uplink (if yes -> clean replace is
++ * achievable in our domain; if no -> the mute is downstream in signed ADSP firmware).
++ * Default 0 = off (no decimator forced-muted) -> stock behaviour, calls unaffected.
++ */
++static int avcrt_dec_mute_mask;
++
++static int tx_macro_avcrt_mute_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	ucontrol->value.integer.value[0] = avcrt_dec_mute_mask;
++	return 0;
++}
++
++static int tx_macro_avcrt_mute_put(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component =
++			snd_soc_kcontrol_component(kcontrol);
++	struct device *tx_dev = NULL;
++	struct tx_macro_priv *tx_priv = NULL;
++	int mask = ucontrol->value.integer.value[0];
++	int i;
++
++	if (!tx_macro_get_data(component, &tx_dev, &tx_priv, __func__))
++		return -EINVAL;
++
++	avcrt_dec_mute_mask = mask;
++	for (i = 0; i < NUM_DECIMATORS; i++) {
++		u16 reg = BOLERO_CDC_TX0_TX_PATH_CTL +
++			  TX_MACRO_TX_PATH_OFFSET * i;
++		u8 val = (mask & (1 << i)) ? 0x10 : 0x00;
++
++		snd_soc_component_update_bits(component, reg, 0x10, val);
++		dev_info(component->dev,
++			 "AVCRT: DEC%d mute=%d (reg 0x%04x bit 0x10)\n",
++			 i, !!(mask & (1 << i)), reg);
++	}
++	return 0;
++}
++
+ static const struct snd_kcontrol_new tx_macro_snd_controls[] = {
++	SOC_SINGLE_EXT("AVCRT Dec Mute", SND_SOC_NOPM, 0, 0xFF, 0,
++			tx_macro_avcrt_mute_get, tx_macro_avcrt_mute_put),
+ 	SOC_SINGLE_SX_TLV("TX_DEC0 Volume",
+ 			  BOLERO_CDC_TX0_TX_VOL_CTL,
+ 			  0, -84, 40, digital_gain),
