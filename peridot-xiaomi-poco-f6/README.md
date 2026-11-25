@@ -17,9 +17,8 @@ calls on compatible codec and USB-C headset routes.
 
 ## How to apply
 
-Apply from the root of the clean Linux 6.1 **vendor modules** source tree, not
-the main kernel tree. Use the `seventeen` base at commit
-[`ed4ad0d1ad00`](https://github.com/peridot-dev/android_kernel_xiaomi_sm8635-modules/commit/ed4ad0d1ad00b755af2fe61387dcc5397ad20b8f).
+Apply from the root of a clean, compatible Linux 6.1 **vendor modules** source
+tree for Poco F6, not the main kernel tree.
 Adjust `patch_dir` if the repositories are not siblings.
 
 ```sh
